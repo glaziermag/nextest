@@ -1,0 +1,98 @@
+# FORK-ONLY demonstration workflow. Never proposed upstream.
+# Shows that a recording-SETUP failure aborts the entire test run (exit 96,
+# zero tests executed), contrasted with the same run succeeding when the
+# state dir is writable.
+name: record-setup-fatal-demo
+on:
+  workflow_dispatch:
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build cargo-nextest
+        run: cargo build --release --bin cargo-nextest
+
+      - name: Enable experimental recording in user config
+        run: |
+          mkdir -p ~/.config/nextest
+          cat > ~/.config/nextest/config.toml <<'EOF'
+          [experimental]
+          record = true
+
+          [record]
+          enabled = true
+          EOF
+          echo "--- user config ---"; cat ~/.config/nextest/config.toml
+
+      - name: Create a tiny throwaway crate with one passing test
+        run: |
+          mkdir -p /tmp/demo/src
+          cd /tmp/demo
+          cat > Cargo.toml <<'EOF'
+          [package]
+          name = "demo"
+          version = "0.1.0"
+          edition = "2021"
+          EOF
+          cat > src/lib.rs <<'EOF'
+          #[test]
+          fn it_passes() { assert_eq!(2 + 2, 4); }
+          EOF
+
+      - name: CONTROL — writable state dir (recording works, test runs)
+        run: |
+          export PATH="$GITHUB_WORKSPACE/target/release:$PATH"
+          mkdir -p /tmp/state-ok
+          cd /tmp/demo
+          set +e
+          NEXTEST_STATE_DIR=/tmp/state-ok cargo nextest run 2>&1 | tee /tmp/control.log
+          echo "CONTROL_EXIT=${PIPESTATUS[0]}" | tee /tmp/control.exit
+          set -e
+
+      - name: EXPERIMENT — read-only state dir (recording setup fails)
+        run: |
+          export PATH="$GITHUB_WORKSPACE/target/release:$PATH"
+          mkdir -p /tmp/state-ro
+          chmod 555 /tmp/state-ro
+          cd /tmp/demo
+          set +e
+          NEXTEST_STATE_DIR=/tmp/state-ro cargo nextest run 2>&1 | tee /tmp/ro.log
+          echo "RO_EXIT=${PIPESTATUS[0]}" | tee /tmp/ro.exit
+          set -e
+
+      - name: EXPERIMENT 2 — corrupted index (the doc's own example)
+        run: |
+          export PATH="$GITHUB_WORKSPACE/target/release:$PATH"
+          cd /tmp/demo
+          # /tmp/state-ok now holds a valid store from the control run; corrupt its index.
+          RUNS_JSON=$(find /tmp/state-ok -name 'runs.json.zst' | head -1)
+          echo "corrupting: $RUNS_JSON"
+          printf 'not-zstd-garbage' > "$RUNS_JSON"
+          set +e
+          NEXTEST_STATE_DIR=/tmp/state-ok cargo nextest run 2>&1 | tee /tmp/corrupt.log
+          echo "CORRUPT_EXIT=${PIPESTATUS[0]}" | tee /tmp/corrupt.exit
+          set -e
+
+      - name: SUMMARY
+        run: |
+          echo "=================== RESULTS ==================="
+          echo "--- control (writable state dir) ---"
+          cat /tmp/control.exit
+          grep -E "Summary|test run|Starting" /tmp/control.log | tail -3 || true
+          echo
+          echo "--- read-only state dir ---"
+          cat /tmp/ro.exit
+          echo "stderr:"; tail -6 /tmp/ro.log
+          echo "tests executed? (expect NO 'Summary' line):"
+          grep -c "Summary" /tmp/ro.log || echo "0 (no tests ran)"
+          echo
+          echo "--- corrupted runs.json.zst (doc's 'corrupted index') ---"
+          cat /tmp/corrupt.exit
+          echo "stderr:"; tail -6 /tmp/corrupt.log
+          echo "tests executed? (expect NO 'Summary' line):"
+          grep -c "Summary" /tmp/corrupt.log || echo "0 (no tests ran)"
+          echo "==============================================="
+          echo "nextest version:"; cargo nextest --version || true
