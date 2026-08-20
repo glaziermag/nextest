@@ -1,0 +1,116 @@
+# Fork-only probe: does a SIGTSTP pause window leak into nextest's
+# per-test timers and reported times? (signal-handling.md guarantee.)
+# Never proposed upstream.
+name: pause-probe
+
+on:
+  push:
+    branches: [probe-pause-timers]
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build cargo-nextest at HEAD
+        run: cargo build --release -p cargo-nextest
+
+      - name: Create probe crate
+        run: |
+          NX="$GITHUB_WORKSPACE/target/release/cargo-nextest"
+          "$NX" nextest --version
+          cargo new --lib /tmp/probe
+          cat >> /tmp/probe/src/lib.rs <<'RS'
+
+          #[cfg(test)]
+          mod tests {
+              #[test]
+              fn sleeper() {
+                  std::thread::sleep(std::time::Duration::from_secs(6));
+              }
+          }
+          RS
+          mkdir -p /tmp/probe/.config
+          cat > /tmp/probe/.config/nextest.toml <<'TOML'
+          [profile.default]
+          slow-timeout = { period = "10s", terminate-after = 1 }
+
+          [profile.default.junit]
+          path = "junit.xml"
+
+          [profile.reported]
+          slow-timeout = { period = "60s", terminate-after = 1 }
+
+          [profile.reported.junit]
+          path = "junit-reported.xml"
+          TOML
+          cd /tmp/probe && cargo build --tests
+
+      - name: "Scenario CONTROL: no pause (expect PASS ~6s)"
+        run: |
+          NX="$GITHUB_WORKSPACE/target/release/cargo-nextest"
+          cd /tmp/probe
+          "$NX" nextest run 2>&1 | tee /tmp/control.log
+          echo "control-exit=$?"
+
+      - name: "Scenario A: pause across slow-timeout period (guarantee => PASS)"
+        continue-on-error: true
+        run: |
+          NX="$GITHUB_WORKSPACE/target/release/cargo-nextest"
+          cd /tmp/probe
+          start=$(date +%s)
+          "$NX" nextest run > /tmp/pauseA.log 2>&1 &
+          NPID=$!
+          sleep 3
+          kill -TSTP $NPID || echo "TSTP failed"
+          sleep 15
+          kill -CONT $NPID || echo "CONT failed"
+          wait $NPID; rc=$?
+          end=$(date +%s)
+          echo "scenarioA-exit=$rc wall=$((end-start))s"
+          cat /tmp/pauseA.log
+          cp target/nextest/default/junit.xml /tmp/junitA.xml || true
+          cat /tmp/junitA.xml || true
+
+      - name: "Scenario C: pause with no timeout crossing (guarantee => reported ~6s not ~14s)"
+        continue-on-error: true
+        run: |
+          NX="$GITHUB_WORKSPACE/target/release/cargo-nextest"
+          cd /tmp/probe
+          "$NX" nextest run --profile reported > /tmp/pauseC.log 2>&1 &
+          NPID=$!
+          sleep 3
+          kill -TSTP $NPID || echo "TSTP failed"
+          sleep 8
+          kill -CONT $NPID || echo "CONT failed"
+          wait $NPID; rc=$?
+          echo "scenarioC-exit=$rc"
+          cat /tmp/pauseC.log
+          cp target/nextest/reported/junit-reported.xml /tmp/junitC.xml || true
+          cat /tmp/junitC.xml || true
+
+      - name: "Scenario B: global timeout across pause (informational)"
+        continue-on-error: true
+        run: |
+          NX="$GITHUB_WORKSPACE/target/release/cargo-nextest"
+          cd /tmp/probe
+          if "$NX" nextest run --help 2>&1 | grep -qi "global-timeout"; then
+            "$NX" nextest run --global-timeout 15s > /tmp/pauseB.log 2>&1 &
+            NPID=$!
+            sleep 3
+            kill -TSTP $NPID || echo "TSTP failed"
+            sleep 15
+            kill -CONT $NPID || echo "CONT failed"
+            wait $NPID; rc=$?
+            echo "scenarioB-exit=$rc"
+            cat /tmp/pauseB.log
+          else
+            echo "no --global-timeout flag at HEAD; skipping"
+          fi
