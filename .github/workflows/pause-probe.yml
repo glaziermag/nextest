@@ -27,7 +27,7 @@ jobs:
           NX="$GITHUB_WORKSPACE/target/release/cargo-nextest"
           "$NX" nextest --version
           cargo new --lib /tmp/probe
-          cat >> /tmp/probe/src/lib.rs <<'RS'
+          cat > /tmp/probe/src/lib.rs <<'RS'
 
           #[cfg(test)]
           mod tests {
